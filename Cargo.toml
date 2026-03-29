@@ -1,0 +1,16 @@
+[package]
+name = "bqcount"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+binseq = "0.9"
+bitnuc = "0.4"
+clap = { version = "4", features = ["derive"] }
+hashbrown = "0.15"
+parking_lot = "0.12"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
