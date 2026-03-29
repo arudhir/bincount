@@ -1,4 +1,7 @@
 /target
-/bench
+/bench/data/
+/bench/genomes/
+/bench/results/*_timing.txt
+/bench/results/*_hist.tsv
 /test_data
 .claude/
