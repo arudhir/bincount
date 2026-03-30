@@ -152,7 +152,6 @@ dependencies = [
  "bitnuc",
  "clap",
  "hashbrown",
- "parking_lot",
 ]
 
 [[package]]
