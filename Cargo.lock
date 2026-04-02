@@ -152,6 +152,7 @@ dependencies = [
  "bitnuc",
  "clap",
  "hashbrown",
+ "nthash",
 ]
 
 [[package]]
@@ -532,6 +533,15 @@ dependencies = [
  "liblzma",
  "thiserror 2.0.18",
  "zstd",
+]
+
+[[package]]
+name = "nthash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "752ed59e65983a1ba3166fcdf684107b9f43913a937d3250aa98f26ce586c2d0"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]

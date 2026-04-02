@@ -9,6 +9,7 @@ bitnuc = "0.4"
 clap = { version = "4", features = ["derive"] }
 hashbrown = "0.15"
 anyhow = "1"
+nthash = "0.5"
 
 [profile.release]
 opt-level = 3
