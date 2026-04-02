@@ -41,6 +41,36 @@ extract_unique_kmers_jf() {
     awk '{s+=$2} END {print s}' "$1"
 }
 
+# Compute table size needed: 2x the unique k-mers from jellyfish, rounded up to next power of 2.
+# Falls back to 256M if jellyfish data is missing.
+compute_table_size() {
+    local org=$1 error=$2 coverage=$3 k=$4 threads=$5
+    local tag="${org}_e${error}_c${coverage}_k${k}_t${threads}"
+    local jf_hist="$RESULTS_DIR/${tag}_jf_hist.tsv"
+
+    if [[ ! -f "$jf_hist" ]] || [[ ! -s "$jf_hist" ]]; then
+        echo "256M"
+        return
+    fi
+
+    local unique_kmers
+    unique_kmers=$(awk '{s+=$2} END {print s}' "$jf_hist")
+    # 2x headroom, rounded up to standard sizes
+    local needed=$(python3 -c "
+u = int(${unique_kmers:-0})
+needed = max(u * 2, 128_000_000)
+# Standard sizes in ascending order
+sizes = [(128,'128M'),(256,'256M'),(512,'512M'),(1024,'1G'),(2048,'2G'),(4096,'4G')]
+for m, label in sizes:
+    if needed <= m * 1_000_000:
+        print(label)
+        break
+else:
+    print('4G')
+")
+    echo "$needed"
+}
+
 # Re-run bqcount for a config, replacing old histogram and timing
 run_bqcount() {
     local sweep=$1 org=$2 error=$3 coverage=$4 k=$5 threads=$6
@@ -51,8 +81,11 @@ run_bqcount() {
 
     rm -f "$bq_hist" "$timing_file"
 
-    log "  bqcount ${tag}..."
-    { $TIME -l $BQCOUNT "$datadir/reads.bq" -k "$k" -t "$threads" -o "$bq_hist" ; } 2> "$timing_file"
+    local table_size
+    table_size=$(compute_table_size "$org" "$error" "$coverage" "$k" "$threads")
+
+    log "  bqcount ${tag} (table: ${table_size})..."
+    { $TIME -l $BQCOUNT "$datadir/reads.bq" -k "$k" -t "$threads" -s "$table_size" -o "$bq_hist" ; } 2> "$timing_file"
 
     local unique_kmers=$(extract_unique_kmers_bq "$timing_file")
     local timing=$(parse_timing "$timing_file")
