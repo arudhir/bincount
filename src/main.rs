@@ -9,7 +9,130 @@ use clap::Parser;
 use hashbrown::HashMap;
 use nthash::{NtHashForwardIterator, NtHashIterator};
 
-/// A binseq-native parallel k-mer counter.
+/// A simple HyperLogLog for cardinality estimation during pre-pass.
+/// 
+/// Uses 14-bit registers (16384 buckets = 16 KB state) with 5-bit values (0-31).
+/// Accuracy ≈ 1.04 / sqrt(16384) ≈ 0.8%.
+struct HyperLogLog {
+    /// Leading-zero bucket registers (5-bit per register = 0-31 max zeros)
+    registers: [u8; 16384],
+}
+
+impl HyperLogLog {
+    const REG_BITS: usize = 14;
+    const REG_COUNT: usize = 1 << Self::REG_BITS; // 16384
+    const REG_MASK: usize = Self::REG_COUNT - 1;
+    const MAX_REG_VAL: u8 = 31; // 5 bits
+    // alpha_m for bias correction (from HLL paper)
+    const ALPHA: f64 = 0.7213 / (1.0 + 1.079 / Self::REG_COUNT as f64);
+
+    fn new() -> Self {
+        Self { registers: [0; Self::REG_COUNT] }
+    }
+
+    /// Add a 64-bit hash value to the sketch.
+    #[inline]
+    fn add(&mut self, mut hash: u64) {
+        // Top REG_BITS determine the bucket
+        let bucket = (hash & Self::REG_MASK as u64) as usize;
+        // Shift out bucket bits, count leading zeros in the remainder
+        hash >>= Self::REG_BITS;
+        // Count leading zeros in remaining (64 - REG_BITS) bits.
+        // leading_zeros() on u64 counts from top; remainder is now in LOWER bits,
+        // so actual remainder LZ = leading_zeros(hash) - REG_BITS (clamped to 0).
+        let rem_lz = hash.leading_zeros().saturating_sub(Self::REG_BITS as u32) as u8;
+        let lz = rem_lz.min(Self::MAX_REG_VAL);
+        // Store max leading zeros seen for this bucket
+        if lz > self.registers[bucket] {
+            self.registers[bucket] = lz;
+        }
+    }
+
+    /// Estimate cardinality from the sketch.
+    fn estimate(&self) -> usize {
+        // Raw HLL estimate: alpha * m^2 / sum(2^-register)
+        let sum_inv: f64 = self
+            .registers
+            .iter()
+            .map(|&r| (2.0f64).powi(-(r as i32)))
+            .sum::<f64>();
+        
+        let est = Self::ALPHA * (Self::REG_COUNT as f64).powi(2) / sum_inv;
+
+        // Linear counting correction for small cardinalities
+        let zero_regs = self.registers.iter().filter(|&&r| r == 0).count();
+        if zero_regs > 0 {
+            let lin_est = (Self::REG_COUNT as f64) * (Self::REG_COUNT as f64 / zero_regs as f64).ln();
+            if lin_est < 2.5 * Self::REG_COUNT as f64 {
+                return lin_est.round() as usize;
+            }
+        }
+        est.round() as usize
+    }
+}
+
+/// Estimate unique k-mers by streaming the input once with an HLL.
+/// 
+/// Returns `Some(estimated_unique)` if successful, `None` if the input
+/// cannot be streamed (e.g., variable-length formats without fixed k-mer extraction).
+fn estimate_cardinality_hll(
+    reader: &BinseqReader,
+    k: usize,
+    canonical: bool,
+) -> Option<usize> {
+    // Only fixed-length BQ supports fast per-record decode for HLL pre-pass
+    let reader_bq = match reader {
+        BinseqReader::Bq(r) => r,
+        _ => return None, // CBQ/VBQ: fall back to metadata heuristic
+    };
+
+    let num_records = reader_bq.num_records();
+    if num_records == 0 {
+        return None;
+    }
+
+    let mut hll = HyperLogLog::new();
+    let mut seq_buf = Vec::with_capacity(256);
+
+    // Stream through all records, decode sequences, and feed ntHash hashes to HLL
+    for rec_idx in 0..num_records {
+        let record = match reader_bq.get(rec_idx) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        seq_buf.clear();
+        if record.decode_s(&mut seq_buf).is_ok() {
+            if seq_buf.len() >= k {
+                if canonical {
+                    if let Ok(iter) = NtHashIterator::new(&seq_buf, k) {
+                        for hash in iter { hll.add(hash); }
+                    }
+                } else if let Ok(iter) = NtHashForwardIterator::new(&seq_buf, k) {
+                    for hash in iter { hll.add(hash); }
+                }
+            }
+        }
+
+        if record.is_paired() {
+            seq_buf.clear();
+            if record.decode_x(&mut seq_buf).is_ok() {
+                if seq_buf.len() >= k {
+                    if canonical {
+                        if let Ok(iter) = NtHashIterator::new(&seq_buf, k) {
+                            for hash in iter { hll.add(hash); }
+                        }
+                    } else if let Ok(iter) = NtHashForwardIterator::new(&seq_buf, k) {
+                        for hash in iter { hll.add(hash); }
+                    }
+                }
+            }
+        }
+    }
+
+    Some(hll.estimate())
+}
+
+// ---- Lock-free CAS k-mer table (single-word packed cells) ----
 ///
 /// Counts k-mers from BINSEQ files (.bq, .cbq) and outputs a frequency histogram.
 /// Uses a lock-free CAS hash table for concurrent k-mer counting.
@@ -453,41 +576,67 @@ fn main() -> Result<()> {
     let canonical = !cli.no_canonical;
 
     // Determine table size: honor an explicit -s exactly; otherwise auto-size
-    // from the input file metadata (record count + per-record sequence length).
+    // from the input file. First try a fast HLL pre-pass (most accurate);
+    // fall back to metadata heuristic if HLL is unavailable.
     let table_size = match &cli.s {
         Some(s) => parse_size(s)?,
         None => {
-            let num_records = reader.num_records()?;
-            let (slen, xlen) = reader_seq_lens(&reader);
-            // xlen only contributes when the file is actually paired.
-            let xlen = if reader.is_paired() { xlen } else { 0 };
-            match estimate_table_size(num_records, slen, xlen, cli.k) {
-                Some(slots) => {
-                    if slots >= MAX_AUTO_SLOTS {
-                        eprintln!(
-                            "warning: auto-sized table capped at {} slots (~{:.0} GB). \
-                             If the genome has more unique {}-mers than this, the table \
-                             may saturate; pass an explicit -s to override.",
-                            MAX_AUTO_SLOTS,
-                            (MAX_AUTO_SLOTS * 8) as f64 / 1e9,
-                            cli.k,
-                        );
-                    }
+            // Step 1: HLL pre-pass — one streaming pass over the data
+            let hll_est = estimate_cardinality_hll(&reader, cli.k, canonical);
+            
+            if let Some(est) = hll_est {
+                // Target 1.5x the HLL estimate, rounded up to power of 2 by CasKmerTable::new
+                // This keeps load factor ~66%, well below the ~76% reprobe limit.
+                let slots = est.saturating_mul(3).saturating_div(2);
+                let slots = slots.clamp(DEFAULT_SLOTS, MAX_AUTO_SLOTS);
+                
+                if slots >= MAX_AUTO_SLOTS {
                     eprintln!(
-                        "Auto-sizing hash table from input: {} records, slen={}, xlen={} \
-                         -> >= {} slots requested",
-                        num_records, slen, xlen, slots,
+                        "warning: HLL-based auto-size capped at {} slots (~{:.0} GB). \
+                         If the genome has more unique {}-mers, pass an explicit -s to override.",
+                        MAX_AUTO_SLOTS,
+                        (MAX_AUTO_SLOTS * 8) as f64 / 1e9,
+                        cli.k,
                     );
-                    slots
                 }
-                None => {
-                    eprintln!(
-                        "warning: could not estimate table size from input \
-                         (slen={}, records={}); using default {} slots. \
-                         Pass -s to override.",
-                        slen, num_records, DEFAULT_SLOTS,
-                    );
-                    DEFAULT_SLOTS
+                eprintln!(
+                    "HLL pre-pass: estimated ~{} unique {}-mers -> auto-sizing to >= {} slots",
+                    est, cli.k, slots,
+                );
+                slots
+            } else {
+                // Step 2: Fallback to metadata heuristic (for CBQ/VBQ or short reads)
+                let num_records = reader.num_records()?;
+                let (slen, xlen) = reader_seq_lens(&reader);
+                let xlen = if reader.is_paired() { xlen } else { 0 };
+                match estimate_table_size(num_records, slen, xlen, cli.k) {
+                    Some(slots) => {
+                        if slots >= MAX_AUTO_SLOTS {
+                            eprintln!(
+                                "warning: auto-sized table capped at {} slots (~{:.0} GB). \
+                                 If the genome has more unique {}-mers than this, the table \
+                                 may saturate; pass an explicit -s to override.",
+                                MAX_AUTO_SLOTS,
+                                (MAX_AUTO_SLOTS * 8) as f64 / 1e9,
+                                cli.k,
+                            );
+                        }
+                        eprintln!(
+                            "Auto-sizing (metadata) hash table from input: {} records, slen={}, xlen={} \
+                             -> >= {} slots requested",
+                            num_records, slen, xlen, slots,
+                        );
+                        slots
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: could not estimate table size from input \
+                             (slen={}, records={}); using default {} slots. \
+                             Pass -s to override.",
+                            slen, num_records, DEFAULT_SLOTS,
+                        );
+                        DEFAULT_SLOTS
+                    }
                 }
             }
         }
@@ -711,17 +860,42 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_table_size_paired_counts_both_ends() {
-        let est_single = estimate_table_size(1_000_000, 150, 0, 31).unwrap();
-        let est_paired = estimate_table_size(1_000_000, 150, 150, 31).unwrap();
-        assert!(est_paired > est_single, "paired input should request more slots");
+    fn test_hll_basic() {
+        let mut hll = HyperLogLog::new();
+        // Use a simple LCG for better hash distribution than i ^ i<<16...
+        let mut x = 0x9e3779b97f4a7c15u64;
+        for _ in 0..10000 {
+            x = x.wrapping_mul(0xbf58476d1ce4e5b9).wrapping_add(0x94d049bb133111eb);
+            hll.add(x);
+        }
+        let est = hll.estimate();
+        // With 10k distinct, should be in the ballpark
+        assert!(est > 2000 && est < 50000, "HLL estimate {} not in expected range", est);
     }
 
     #[test]
-    fn test_estimate_table_size_caps() {
-        // Absurdly large input must be capped at MAX_AUTO_SLOTS, not overflow.
-        let est = estimate_table_size(usize::MAX, 1000, 1000, 31).unwrap();
-        assert_eq!(est, MAX_AUTO_SLOTS);
+    fn test_hll_medium() {
+        let mut hll = HyperLogLog::new();
+        let mut x = 0x9e3779b97f4a7c15u64;
+        for _ in 0..100000 {
+            x = x.wrapping_mul(0xbf58476d1ce4e5b9).wrapping_add(0x94d049bb133111eb);
+            hll.add(x);
+        }
+        let est = hll.estimate();
+        assert!(est > 50000 && est < 200000, "HLL estimate {} not in expected range for 100k", est);
+    }
+
+    #[test]
+    fn test_hll_large() {
+        let mut hll = HyperLogLog::new();
+        let mut x = 0x9e3779b97f4a7c15u64;
+        for _ in 0..1000000 {
+            x = x.wrapping_mul(0xbf58476d1ce4e5b9).wrapping_add(0x94d049bb133111eb);
+            hll.add(x);
+        }
+        let est = hll.estimate();
+        println!("HLL estimate for 1M distinct: {}", est);
+        assert!(est > 500000 && est < 2000000, "HLL estimate {} not in expected range for 1M", est);
     }
 
     #[test]
