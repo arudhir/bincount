@@ -28,7 +28,7 @@ WGSIM_MUT_RATE=0.001
 # Genome URLs (NCBI FTP)
 typeset -A GENOME_URLS
 GENOME_URLS=(
-    mflorum "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/180/455/GCF_000180455.1_ASM18045v1/GCF_000180455.1_ASM18045v1_genomic.fna.gz"
+    mflorum "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/008/305/GCA_000008305.1_ASM830v1/GCA_000008305.1_ASM830v1_genomic.fna.gz"
     ecoli   "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz"
     yeast   "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/146/045/GCF_000146045.2_R64/GCF_000146045.2_R64_genomic.fna.gz"
 )
@@ -239,8 +239,28 @@ run_bqcount() {
         return
     fi
 
-    log "  bqcount ${tag}..."
-    { $TIME -l $BQCOUNT "$datadir/reads.bq" -k "$k" -t "$threads" -o "$bq_hist" ; } 2> "$timing_file"
+    # Auto-size the hash table: bqcount's open-addressing table panics
+    # ("Hash table full") near ~76% load on the 128M default. Size to 2x the
+    # unique k-mers from the jellyfish histogram (already produced for this
+    # config), rounded up to a standard size. Falls back to 256M.
+    local jf_hist="$RESULTS_DIR/${tag}_jf_hist.tsv"
+    local table_size="256M"
+    if [[ -f "$jf_hist" && -s "$jf_hist" ]]; then
+        local uniq
+        uniq=$(awk '{s+=$2} END {print s}' "$jf_hist")
+        table_size=$(python3 -c "
+u = int(${uniq:-0})
+needed = max(u * 2, 128_000_000)
+for m, label in [(128,'128M'),(256,'256M'),(512,'512M'),(1024,'1G'),(2048,'2G'),(4096,'4G'),(8192,'8G')]:
+    if needed <= m * 1_000_000:
+        print(label); break
+else:
+    print('8G')
+")
+    fi
+
+    log "  bqcount ${tag} (table: ${table_size})..."
+    { $TIME -l $BQCOUNT "$datadir/reads.bq" -k "$k" -t "$threads" -s "$table_size" -o "$bq_hist" ; } 2> "$timing_file"
 
     local unique_kmers
     unique_kmers=$(extract_unique_kmers_bq "$timing_file")

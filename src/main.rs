@@ -1,6 +1,6 @@
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -28,8 +28,9 @@ struct Cli {
     t: usize,
 
     /// Hash table slots. Must exceed expected unique k-mers. Suffixes: K, M, G.
-    #[arg(short, default_value = "128M")]
-    s: String,
+    /// If omitted, the table is sized automatically from the input file.
+    #[arg(short)]
+    s: Option<String>,
 
     /// Output file (default: stdout)
     #[arg(short)]
@@ -59,6 +60,46 @@ fn parse_size(s: &str) -> Result<usize> {
     Ok(n * mult)
 }
 
+/// Default table size used when the input provides no usable size hint
+/// (e.g. variable-length files with slen == 0).
+const DEFAULT_SLOTS: usize = 128_000_000;
+
+/// Hard cap on auto-sized tables: 8G slots = 64 GB at 8 bytes/slot.
+const MAX_AUTO_SLOTS: usize = 8usize << 30; // 8_589_934_592
+
+/// Estimate a sensible number of hash-table slots from input metadata.
+///
+/// `num_records` is the number of records in the file, `slen`/`xlen` are the
+/// per-record primary/extended sequence lengths from the file header (xlen == 0
+/// when unpaired). `k` is the k-mer size.
+///
+/// An upper bound on total k-mers is `num_records * ((slen - k + 1) + (xlen - k + 1))`.
+/// Unique k-mers can never exceed this. We target `2 * upper_bound` slots
+/// (then rounded up to a power of two by `CasKmerTable::new`) so the table stays
+/// well below the ~76% load factor that triggers reprobe saturation, with a floor
+/// of `DEFAULT_SLOTS` and a cap of `MAX_AUTO_SLOTS`.
+///
+/// Returns `None` when no useful estimate can be made (slen too short / zero),
+/// signalling the caller to fall back to the default size.
+fn estimate_table_size(num_records: usize, slen: usize, xlen: usize, k: usize) -> Option<usize> {
+    let per_seq = |len: usize| -> usize {
+        if len >= k {
+            len - k + 1
+        } else {
+            0
+        }
+    };
+    let kmers_per_record = per_seq(slen).saturating_add(per_seq(xlen));
+    if kmers_per_record == 0 || num_records == 0 {
+        return None;
+    }
+    let upper_bound = (num_records as u128) * (kmers_per_record as u128);
+    // Target 2x headroom over the upper bound on unique k-mers.
+    let target = upper_bound.saturating_mul(2);
+    let target = target.min(MAX_AUTO_SLOTS as u128) as usize;
+    Some(target.max(DEFAULT_SLOTS))
+}
+
 // ---- Lock-free CAS k-mer table (single-word packed cells) ----
 
 const OCCUPIED_BIT: u64 = 1 << 63;
@@ -84,6 +125,9 @@ struct CasKmerTable {
     table_bits: u32,
     count_bits: u32,
     count_mask: u64,
+    /// Set by worker threads when the table saturates (reprobe limit hit)
+    /// instead of panicking. Checked after parallel processing completes.
+    saturated: AtomicBool,
 }
 
 impl CasKmerTable {
@@ -115,7 +159,19 @@ impl CasKmerTable {
             table_bits,
             count_bits,
             count_mask,
+            saturated: AtomicBool::new(false),
         })
+    }
+
+    /// Record that the table saturated (reprobe limit hit) in a worker thread.
+    #[inline]
+    fn mark_saturated(&self) {
+        self.saturated.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether any worker thread hit the reprobe limit during insertion.
+    fn is_saturated(&self) -> bool {
+        self.saturated.load(Ordering::Relaxed)
     }
 
     /// splitmix64 finalizer — fast, good avalanche, bijective on u64.
@@ -289,6 +345,9 @@ struct KmerCounter {
 }
 
 /// Count k-mers using ntHash rolling hash (O(1) per k-mer). Histogram mode only.
+///
+/// On reprobe-limit saturation, sets the table's `saturated` flag and returns
+/// early instead of panicking; the condition is surfaced cleanly by `main`.
 #[inline]
 fn count_kmers_rolling(seq: &[u8], k: usize, canonical: bool, table: &CasKmerTable) {
     if seq.len() < k {
@@ -298,28 +357,25 @@ fn count_kmers_rolling(seq: &[u8], k: usize, canonical: bool, table: &CasKmerTab
         if let Ok(iter) = NtHashIterator::new(seq, k) {
             for hash in iter {
                 if !table.insert_hash(hash) {
-                    panic!(
-                        "Hash table full (reprobe limit reached at {} slots). \
-                         Re-run with a larger -s value.",
-                        table.slots
-                    );
+                    table.mark_saturated();
+                    return;
                 }
             }
         }
     } else if let Ok(iter) = NtHashForwardIterator::new(seq, k) {
         for hash in iter {
             if !table.insert_hash(hash) {
-                panic!(
-                    "Hash table full (reprobe limit reached at {} slots). \
-                     Re-run with a larger -s value.",
-                    table.slots
-                );
+                table.mark_saturated();
+                return;
             }
         }
     }
 }
 
 /// Count k-mers with packed 2-bit encoding (O(k) per k-mer). Required for --dump mode.
+///
+/// On reprobe-limit saturation, sets the table's `saturated` flag and returns
+/// early instead of panicking; the condition is surfaced cleanly by `main`.
 #[inline]
 fn count_kmers_packed(seq: &[u8], k: usize, canonical: bool, table: &CasKmerTable) {
     if seq.len() < k {
@@ -333,11 +389,8 @@ fn count_kmers_packed(seq: &[u8], k: usize, canonical: bool, table: &CasKmerTabl
                 packed
             };
             if !table.insert(key) {
-                panic!(
-                    "Hash table full (reprobe limit reached at {} slots). \
-                     Re-run with a larger -s value.",
-                    table.slots
-                );
+                table.mark_saturated();
+                return;
             }
         }
     }
@@ -371,6 +424,24 @@ impl ParallelProcessor for KmerCounter {
     }
 }
 
+/// Read the per-record primary (slen) and extended (xlen) sequence lengths
+/// from a reader's file header.
+///
+/// Only the fixed-length BQ format stores per-record sequence lengths in its
+/// header (`slen`/`xlen`). The CBQ and VBQ formats are block-based /
+/// variable-length and expose no file-level fixed sequence length, so we
+/// return `(0, 0)` for them — `estimate_table_size` then yields `None` and the
+/// caller falls back to the default table size.
+fn reader_seq_lens(reader: &BinseqReader) -> (usize, usize) {
+    match reader {
+        BinseqReader::Bq(r) => {
+            let h = r.header();
+            (h.slen as usize, h.xlen as usize)
+        }
+        BinseqReader::Cbq(_) | BinseqReader::Vbq(_) => (0, 0),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -378,7 +449,50 @@ fn main() -> Result<()> {
         anyhow::bail!("k must be between 1 and 31, got {}", cli.k);
     }
 
-    let table_size = parse_size(&cli.s)?;
+    let reader = BinseqReader::new(&cli.input)?;
+    let canonical = !cli.no_canonical;
+
+    // Determine table size: honor an explicit -s exactly; otherwise auto-size
+    // from the input file metadata (record count + per-record sequence length).
+    let table_size = match &cli.s {
+        Some(s) => parse_size(s)?,
+        None => {
+            let num_records = reader.num_records()?;
+            let (slen, xlen) = reader_seq_lens(&reader);
+            // xlen only contributes when the file is actually paired.
+            let xlen = if reader.is_paired() { xlen } else { 0 };
+            match estimate_table_size(num_records, slen, xlen, cli.k) {
+                Some(slots) => {
+                    if slots >= MAX_AUTO_SLOTS {
+                        eprintln!(
+                            "warning: auto-sized table capped at {} slots (~{:.0} GB). \
+                             If the genome has more unique {}-mers than this, the table \
+                             may saturate; pass an explicit -s to override.",
+                            MAX_AUTO_SLOTS,
+                            (MAX_AUTO_SLOTS * 8) as f64 / 1e9,
+                            cli.k,
+                        );
+                    }
+                    eprintln!(
+                        "Auto-sizing hash table from input: {} records, slen={}, xlen={} \
+                         -> >= {} slots requested",
+                        num_records, slen, xlen, slots,
+                    );
+                    slots
+                }
+                None => {
+                    eprintln!(
+                        "warning: could not estimate table size from input \
+                         (slen={}, records={}); using default {} slots. \
+                         Pass -s to override.",
+                        slen, num_records, DEFAULT_SLOTS,
+                    );
+                    DEFAULT_SLOTS
+                }
+            }
+        }
+    };
+
     let table = Arc::new(CasKmerTable::new(table_size, cli.dump)?);
 
     eprintln!(
@@ -388,9 +502,6 @@ fn main() -> Result<()> {
         table.memory_bytes() as f64 / table.slots as f64,
         table.max_count(),
     );
-
-    let reader = BinseqReader::new(&cli.input)?;
-    let canonical = !cli.no_canonical;
 
     let counter = KmerCounter {
         k: cli.k,
@@ -413,6 +524,15 @@ fn main() -> Result<()> {
     );
 
     reader.process_parallel(counter, cli.t)?;
+
+    // Graceful failure: if any worker thread hit the reprobe limit, the table
+    // saturated. Report cleanly and exit nonzero instead of panicking.
+    if table.is_saturated() {
+        anyhow::bail!(
+            "hash table saturated at {} slots; rerun with a larger -s value",
+            table.slots
+        );
+    }
 
     let unique = table.occupied();
     eprintln!("Found {} unique k-mers", unique);
@@ -566,5 +686,49 @@ mod tests {
         assert_eq!(table.table_bits, 27);
         assert_eq!(table.count_bits, 26);
         assert_eq!(table.max_count(), (1 << 26) - 1);
+    }
+
+    #[test]
+    fn test_estimate_table_size_small_floors_to_default() {
+        // A tiny input can't justify a table smaller than the default floor.
+        let est = estimate_table_size(10, 100, 0, 31).unwrap();
+        assert_eq!(est, DEFAULT_SLOTS);
+    }
+
+    #[test]
+    fn test_estimate_table_size_large_genome() {
+        // ~6.7 Mb genome shredded into reads that overflowed the 128M default.
+        // upper bound = num_records * (slen - k + 1); target = 2 * upper_bound.
+        let num_records = 1_000_000usize;
+        let slen = 150usize;
+        let k = 31usize;
+        let kmers_per_record = slen - k + 1; // 120
+        let upper = num_records * kmers_per_record; // 120,000,000
+        let est = estimate_table_size(num_records, slen, 0, k).unwrap();
+        assert_eq!(est, (upper * 2).max(DEFAULT_SLOTS)); // 240,000,000
+        // And it must comfortably exceed the unique-kmer upper bound.
+        assert!(est >= upper);
+    }
+
+    #[test]
+    fn test_estimate_table_size_paired_counts_both_ends() {
+        let est_single = estimate_table_size(1_000_000, 150, 0, 31).unwrap();
+        let est_paired = estimate_table_size(1_000_000, 150, 150, 31).unwrap();
+        assert!(est_paired > est_single, "paired input should request more slots");
+    }
+
+    #[test]
+    fn test_estimate_table_size_caps() {
+        // Absurdly large input must be capped at MAX_AUTO_SLOTS, not overflow.
+        let est = estimate_table_size(usize::MAX, 1000, 1000, 31).unwrap();
+        assert_eq!(est, MAX_AUTO_SLOTS);
+    }
+
+    #[test]
+    fn test_estimate_table_size_none_when_unusable() {
+        // slen shorter than k, or zero records => no estimate possible.
+        assert!(estimate_table_size(100, 10, 0, 31).is_none());
+        assert!(estimate_table_size(0, 150, 0, 31).is_none());
+        assert!(estimate_table_size(100, 0, 0, 31).is_none());
     }
 }
